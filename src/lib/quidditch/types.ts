@@ -187,6 +187,7 @@ export interface GameState {
   participants: Participant[];
   turns: Record<string, TurnState>;
   duel: DuelState | null;
+  duels: DuelState[];
   events: GameEvent[];
   chat: ChatMessage[];
   snapshots: Snapshot[];
@@ -196,6 +197,8 @@ export interface GameState {
   stepPrepared: boolean;
   stunnedNow: string[];
   stunnedForNext: string[];
+  bludgerStreak: Record<string, number>;
+  bludgerGhost: Record<string, number>;
   bludgerHit: [boolean, boolean];
   snitchDone: boolean;
   version: number;

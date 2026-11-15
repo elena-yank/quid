@@ -74,6 +74,7 @@ export function shadow(view: ClientState): GameState {
     participants,
     turns,
     duel: null,
+    duels: [],
     events: [],
     chat: [],
     snapshots: [],
@@ -92,6 +93,8 @@ export function shadow(view: ClientState): GameState {
     stepPrepared: false,
     stunnedNow: [],
     stunnedForNext: [],
+    bludgerStreak: {},
+    bludgerGhost: {},
     bludgerHit: [false, false],
     snitchDone: false,
     version: 1,
@@ -114,6 +117,15 @@ export function legalMoves(view: ClientState, id: string): string[] {
   if (!player) return [];
   const blocked = new Set(view.reservedMoves.filter((c) => state.turns[id]?.plannedTo !== c));
   return listLegalMoves(state, player, blocked);
+}
+
+export function takenCells(view: ClientState, id: string): string[] {
+  const state = shadow(view);
+  const player = state.participants.find((p) => p.id === id);
+  if (!player) return [];
+  const open = new Set(listLegalMoves(state, player));
+  const mine = view.turnStates[id]?.plannedTo ?? null;
+  return view.shownReserved.filter((coord) => open.has(coord) && coord !== mine);
 }
 
 export function quaffleLocked(view: ClientState): boolean {

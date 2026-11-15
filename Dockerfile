@@ -3,6 +3,7 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci
 COPY . .
+RUN node scripts/unpack-assets.mjs
 ENV NITRO_PRESET=node-server
 RUN npm run build
 

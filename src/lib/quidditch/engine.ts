@@ -27,6 +27,8 @@ import {
   actionOrigin,
   ballCells,
   chebyshev,
+  coordToRC,
+  rcToCoord,
   defaultSpawn,
   freshTurn,
   isActiveRole,
@@ -96,6 +98,7 @@ export function createMatch(teamA: TeamKey, teamB: TeamKey, rng: Rng = Math.rand
     participants: [],
     turns: {},
     duel: null,
+    duels: [],
     events: [],
     chat: [],
     snapshots: [],
@@ -114,6 +117,8 @@ export function createMatch(teamA: TeamKey, teamB: TeamKey, rng: Rng = Math.rand
     stepPrepared: false,
     stunnedNow: [],
     stunnedForNext: [],
+    bludgerStreak: {},
+    bludgerGhost: {},
     bludgerHit: [false, false],
     snitchDone: false,
     version: 1,
@@ -165,14 +170,11 @@ export function addParticipant(
 export function removeParticipant(state: GameState, id: string, rng: Rng = Math.random): void {
   const player = state.participants.find((p) => p.id === id);
   if (!player) return;
-  if (state.duel && !state.duel.resolvedAt && state.duel.participantIds.includes(id)) {
-    state.duel.scores[id] = 0;
-    const other = state.duel.participantIds.find((pid) => pid !== id);
-    if (other) state.duel.scores[other] = Math.max(state.duel.scores[other] ?? 0, 100);
-    for (const pid of state.duel.participantIds) {
-      if (state.duel.scores[pid] == null) state.duel.scores[pid] = pid === id ? 0 : 1;
-    }
-    resolveDuel(state, rng);
+  for (const duel of unresolvedDuels(state).filter((item) => item.participantIds.includes(id))) {
+    duel.scores[id] = 0;
+    const others = duel.participantIds.filter((pid) => pid !== id);
+    if (others.length === 1 && duel.scores[others[0]] == null) duel.scores[others[0]] = 100;
+    if (duelComplete(duel)) resolveDuel(state, duel, rng);
   }
   if (state.quaffleHolderId === id) {
     const from = player.pos ?? "D7";
@@ -261,7 +263,22 @@ function nearestFree(state: GameState, from: string): string {
   return "D7";
 }
 
+function ghosting(state: GameState, id: string | null | undefined): boolean {
+  if (!id) return false;
+  return (state.bludgerGhost?.[id] ?? 0) > 0;
+}
+
+function stepBeyond(from: string, cell: string): string | null {
+  const a = coordToRC(from);
+  const b = coordToRC(cell);
+  const dr = Math.sign(b.r - a.r);
+  const dc = Math.sign(b.c - a.c);
+  if (dr === 0 && dc === 0) return null;
+  return rcToCoord(b.r + dr, b.c + dc);
+}
+
 function stunByBludger(state: GameState, id: string, pos: string, which: 1 | 2, actorId: string | null) {
+  if (ghosting(state, id)) return;
   if (state.stunnedForNext.includes(id)) return;
   stunPlayer(state, id);
   if (actorId) {
@@ -373,20 +390,38 @@ export function performThrow(state: GameState, actorId: string, actionFirst: boo
 
 function applyHit(state: GameState, actorId: string, which: 1 | 2, target: string) {
   const from = which === 1 ? state.bludger1Pos : state.bludger2Pos;
-  const cells = lineCells(from, target, 3);
-  if (!cells) return;
+  const aimed = lineCells(from, target, 3);
+  if (!aimed) return;
   if (state.bludgerHit[which - 1]) return;
-  let land = target;
+  const path = [...aimed];
+  let cursorFrom = from;
+  let cursor = target;
+  for (let extra = 0; extra < 2; extra++) {
+    const nxt = stepBeyond(cursorFrom, cursor);
+    if (!nxt) break;
+    path.push(nxt);
+    cursorFrom = cursor;
+    cursor = nxt;
+  }
+  let land = from;
   let victim: string | null = null;
   let hitCell: string | null = null;
-  for (const cell of cells) {
+  let targetWasGhost = false;
+  for (const cell of path) {
     const who = occupant(state, cell);
+    if (who && ghosting(state, who.id)) {
+      if (cell === target) targetWasGhost = true;
+      continue;
+    }
     if (who) {
       land = cell;
       victim = who.id;
       hitCell = cell;
       break;
     }
+    land = cell;
+    if (cell === target && !targetWasGhost) break;
+    if (!aimed.includes(cell) && targetWasGhost) break;
   }
   const other = which === 1 ? state.bludger2Pos : state.bludger1Pos;
   if (land === other) {
@@ -394,6 +429,8 @@ function applyHit(state: GameState, actorId: string, which: 1 | 2, target: strin
     options.sort((a, b) => chebyshev(a, target) - chebyshev(b, target) || a.localeCompare(b));
     land = options[0] ?? from;
   }
+  const parked = occupant(state, land);
+  if (parked && ghosting(state, parked.id)) land = from;
   if (which === 1) state.bludger1Pos = land;
   else state.bludger2Pos = land;
   state.bludgerHit[which - 1] = true;
@@ -501,6 +538,22 @@ function collectSteal(state: GameState, postPhase: boolean): Participant[] {
   return out;
 }
 
+function ensureDuels(state: GameState): DuelState[] {
+  if (!Array.isArray(state.duels)) state.duels = [];
+  if (state.duel && !state.duel.resolvedAt && !state.duels.some((duel) => duel.id === state.duel!.id)) {
+    state.duels.unshift(state.duel);
+  }
+  return state.duels;
+}
+
+function unresolvedDuels(state: GameState): DuelState[] {
+  return ensureDuels(state).filter((duel) => !duel.resolvedAt);
+}
+
+function quaffleDuelOpen(state: GameState): boolean {
+  return unresolvedDuels(state).some((duel) => duel.kind === "pickup" || duel.kind === "steal" || duel.kind === "throw_steal");
+}
+
 function openDuel(
   state: GameState,
   kind: DuelKind,
@@ -509,12 +562,14 @@ function openDuel(
   defenderId: string,
   targetPos: string | null,
 ): void {
+  const unique = [...new Set(ids)];
+  if (unique.length < 2) return;
   const scores: Record<string, number | null> = {};
-  for (const id of ids) scores[id] = null;
-  state.duel = {
+  for (const id of unique) scores[id] = null;
+  const duel: DuelState = {
     id: `d_${nid(8)}`,
     kind,
-    participantIds: ids,
+    participantIds: unique,
     attackerId,
     defenderId,
     targetPos,
@@ -526,6 +581,8 @@ function openDuel(
     quafflePos: state.quafflePos,
     holderId: state.quaffleHolderId,
   };
+  ensureDuels(state).push(duel);
+  if (!state.duel || state.duel.resolvedAt) state.duel = duel;
 }
 
 function pickWinner(duel: DuelState, holderId: string | null) {
@@ -550,9 +607,39 @@ function pickWinner(duel: DuelState, holderId: string | null) {
   return { winnerId: [...bestIds].sort()[0] ?? null, topTie, bestScore: best, bestIds, tiePolicy: "lex" };
 }
 
-function resolveDuel(state: GameState, _rng: Rng) {
-  const duel = state.duel;
-  if (!duel || duel.resolvedAt) return;
+function movedAlready(state: GameState): boolean {
+  return (
+    state.phase === "goal" ||
+    state.phase === "post_collect" ||
+    state.phase === "snitch" ||
+    state.phase === "auto_keeper" ||
+    state.phase === "post_actions" ||
+    state.phase === "bludgers" ||
+    state.phase === "finalize"
+  );
+}
+
+function commitBludgerWin(state: GameState, winnerId: string) {
+  const turn = state.turns[winnerId];
+  const winner = playerById(state, winnerId);
+  if (!turn || turn.actionSpent || !winner) return;
+  if (!state.stunnedNow.includes(winner.id) && turn.plannedActionBludger && turn.plannedActionTo && !state.bludgerHit[turn.plannedActionBludger - 1]) {
+    applyHit(state, winner.id, turn.plannedActionBludger, turn.plannedActionTo);
+  }
+  turn.actionSpent = true;
+}
+
+function applyDeferredContestWins(state: GameState) {
+  for (const duel of ensureDuels(state)) {
+    if (!duel.resolvedAt || !duel.winnerId || duel.createdStepNo !== state.stepNo) continue;
+    const turn = state.turns[duel.winnerId];
+    if (!turn || turn.actionSpent || turn.plannedActionFirst !== false) continue;
+    if (duel.kind === "hit_bludger") commitBludgerWin(state, duel.winnerId);
+  }
+}
+
+function resolveDuel(state: GameState, duel: DuelState, _rng: Rng) {
+  if (duel.resolvedAt) return;
   const picked = pickWinner(duel, duel.holderId);
   duel.resolvedAt = Date.now();
   duel.winnerId = picked.winnerId;
@@ -605,11 +692,8 @@ function resolveDuel(state: GameState, _rng: Rng) {
       }
     }
   } else if (duel.kind === "hit_bludger") {
-    const winner = picked.winnerId ? playerById(state, picked.winnerId) : null;
-    const turn = picked.winnerId ? state.turns[picked.winnerId] : null;
-    if (winner && turn?.plannedActionBludger && turn.plannedActionTo && !state.stunnedNow.includes(winner.id)) {
-      applyHit(state, winner.id, turn.plannedActionBludger, turn.plannedActionTo);
-    }
+    const postTimed = Boolean(picked.winnerId && state.turns[picked.winnerId]?.plannedActionFirst === false);
+    if (picked.winnerId && !(postTimed && !movedAlready(state))) commitBludgerWin(state, picked.winnerId);
   } else if (duel.kind === "snitch") {
     if (picked.winnerId && state.snitchPos && !state.snitchCaughtById) catchSnitch(state, picked.winnerId);
   }
@@ -629,6 +713,15 @@ function resolveDuel(state: GameState, _rng: Rng) {
     const turn = state.turns[id];
     if (!turn) continue;
     if (duel.kind === "steal" && id === duel.holderId) continue;
+    if (unresolvedDuels(state).some((other) => other.id !== duel.id && other.participantIds.includes(id))) continue;
+    if (
+      id === picked.winnerId &&
+      duel.kind === "hit_bludger" &&
+      turn.plannedActionFirst === false &&
+      !movedAlready(state)
+    ) {
+      continue;
+    }
     turn.actionSpent = true;
   }
 }
@@ -727,57 +820,56 @@ function resolvePending(state: GameState) {
 }
 
 function runCollect(state: GameState, postPhase: boolean): boolean {
+  const before = unresolvedDuels(state).length;
+  if (postPhase) applyDeferredContestWins(state);
   const pickups = collectPickup(state, postPhase).filter((p) => (postPhase ? !state.turns[p.id].plannedActionFirst : true));
   const preAndPost = postPhase ? pickups : collectPickup(state, false);
-  if (preAndPost.length >= 2) {
-    openDuel(state, "pickup", preAndPost.map((p) => p.id), preAndPost[0].id, preAndPost[1].id, state.quafflePos);
-    return true;
-  }
-  if (preAndPost.length === 1) {
-    const p = preAndPost[0];
-    const turn = state.turns[p.id];
-    applySimpleAction(state, p, Boolean(turn.plannedActionFirst));
-  }
-  const stealers = collectSteal(state, postPhase);
-  const holder = playerById(state, state.quaffleHolderId);
-  const holderTurn = holder ? state.turns[holder.id] : null;
-  const throwing = Boolean(holder && holderTurn && !holderTurn.actionSpent && holderTurn.plannedActionType === "throw");
-  if (stealers.length && holder && (throwing || !postPhase)) {
-    openDuel(
-      state,
-      throwing ? "throw_steal" : "steal",
-      [holder.id, ...stealers.map((p) => p.id)],
-      stealers[0].id,
-      holder.id,
-      throwing ? `throw:${postPhase ? "post" : "pre"}:${holder.id}` : null,
-    );
-    return true;
-  }
-  if (stealers.length && holder) {
-    openDuel(state, "steal", [holder.id, ...stealers.map((p) => p.id)], stealers[0].id, holder.id, null);
-    return true;
-  }
-  if (!postPhase || postPhase) {
-    const byBludger = new Map<1 | 2, Participant[]>();
-    for (const p of activePlayers(state)) {
+  if (!quaffleDuelOpen(state)) {
+    if (preAndPost.length >= 2) {
+      openDuel(state, "pickup", preAndPost.map((p) => p.id), preAndPost[0].id, preAndPost[1].id, state.quafflePos);
+    } else if (preAndPost.length === 1) {
+      const p = preAndPost[0];
       const turn = state.turns[p.id];
-      if (!turn || turn.actionSpent || turn.plannedActionType !== "hit_bludger" || !turn.plannedActionBludger) continue;
-      if (!isBeater(p.role) && !isKeeper(p.role)) continue;
       const first = Boolean(turn.plannedActionFirst);
-      if (postPhase === first) continue;
-      if (state.bludgerHit[turn.plannedActionBludger - 1]) continue;
-      const list = byBludger.get(turn.plannedActionBludger) ?? [];
-      list.push(p);
-      byBludger.set(turn.plannedActionBludger, list);
-    }
-    for (const [idx, list] of byBludger) {
-      if (list.length >= 2) {
-        openDuel(state, "hit_bludger", list.map((p) => p.id), list[0].id, list[1].id, `b${idx}:${postPhase ? "post" : "pre"}`);
-        return true;
+      if (postPhase !== first) applySimpleAction(state, p, first);
+    } else {
+      const stealers = collectSteal(state, postPhase);
+      const holder = playerById(state, state.quaffleHolderId);
+      const holderTurn = holder ? state.turns[holder.id] : null;
+      const throwing = Boolean(holder && holderTurn && !holderTurn.actionSpent && holderTurn.plannedActionType === "throw");
+      if (stealers.length && holder && (throwing || !postPhase)) {
+        openDuel(
+          state,
+          throwing ? "throw_steal" : "steal",
+          [holder.id, ...stealers.map((p) => p.id)],
+          stealers[0].id,
+          holder.id,
+          throwing ? `throw:${postPhase ? "post" : "pre"}:${holder.id}` : null,
+        );
+      } else if (stealers.length && holder) {
+        openDuel(state, "steal", [holder.id, ...stealers.map((p) => p.id)], stealers[0].id, holder.id, null);
       }
     }
   }
-  return false;
+  const byBludger = new Map<1 | 2, Participant[]>();
+  for (const p of activePlayers(state)) {
+    const turn = state.turns[p.id];
+    if (!turn || turn.actionSpent || turn.plannedActionType !== "hit_bludger" || !turn.plannedActionBludger) continue;
+    if (!isBeater(p.role) && !isKeeper(p.role)) continue;
+    const first = Boolean(turn.plannedActionFirst);
+    if (postPhase && first) continue;
+    if (state.bludgerHit[turn.plannedActionBludger - 1]) continue;
+    const list = byBludger.get(turn.plannedActionBludger) ?? [];
+    list.push(p);
+    byBludger.set(turn.plannedActionBludger, list);
+  }
+  for (const [idx, list] of byBludger) {
+    if (list.length < 2) continue;
+    const mark = `b${idx}`;
+    if (ensureDuels(state).some((duel) => duel.kind === "hit_bludger" && (duel.targetPos === mark || duel.targetPos?.startsWith(`${mark}:`)))) continue;
+    openDuel(state, "hit_bludger", list.map((p) => p.id), list[0].id, list[1].id, mark);
+  }
+  return unresolvedDuels(state).length > before;
 }
 
 function processSnitch(state: GameState, rng: Rng) {
@@ -843,7 +935,10 @@ function processSnitch(state: GameState, rng: Rng) {
   const reachers = seekers.filter((s) => s.snitchProgress >= 100);
   if (reachers.length === 1) catchSnitch(state, reachers[0].id);
   else if (reachers.length >= 2) {
-    openDuel(state, "snitch", reachers.slice(0, 2).map((s) => s.id), reachers[0].id, reachers[1].id, state.snitchPos);
+    const ids = reachers.map((s) => s.id);
+    if (!unresolvedDuels(state).some((duel) => duel.kind === "snitch")) {
+      openDuel(state, "snitch", ids, ids[0], ids[1] ?? ids[0], state.snitchPos);
+    }
   }
   state.snitchDone = true;
 }
@@ -884,36 +979,78 @@ function autoKeeper(state: GameState) {
 }
 
 function moveBludgers(state: GameState, rng: Rng) {
-  const resting = (pos: string) =>
-    activePlayers(state).some((p) => p.pos === pos && (state.stunnedNow.includes(p.id) || state.stunnedForNext.includes(p.id)));
-  const stepOne = (idx: 1 | 2, ownPrev: string | null, extraBan: string | null) => {
+  const onStunned = (pos: string) => activePlayers(state).some((p) => p.pos === pos && state.stunnedNow.includes(p.id));
+  const ghostCell = (coord: string) => {
+    const who = occupant(state, coord);
+    return Boolean(who && ghosting(state, who.id));
+  };
+  const stepTo = (pos: string, other: string, banned: Set<string>, mustLeave: boolean) => {
+    const raw = neighbors(pos).filter((n) => n !== other);
+    const safe = raw.filter((n) => !ghostCell(n));
+    const neigh = safe.length || !mustLeave ? safe : raw;
+    const tiers = mustLeave
+      ? [
+          neigh.filter((n) => !banned.has(n) && n !== state.quafflePos && !occupant(state, n)),
+          neigh.filter((n) => !banned.has(n) && !occupant(state, n)),
+          neigh.filter((n) => !occupant(state, n)),
+          neigh.filter((n) => !banned.has(n) && n !== state.quafflePos),
+          neigh,
+        ]
+      : [neigh.filter((n) => !banned.has(n) && n !== state.quafflePos)];
+    for (const options of tiers) {
+      if (!options.length) continue;
+      return options[Math.floor(rng() * options.length)] ?? pos;
+    }
+    return pos;
+  };
+  const shift = (idx: 1 | 2, extraBan: string | null) => {
     const pos = idx === 1 ? state.bludger1Pos : state.bludger2Pos;
-    if (state.bludgerHit[idx - 1] || resting(pos)) return pos;
+    if (state.bludgerHit[idx - 1]) return;
+    const prev = idx === 1 ? state.bludger1Prev : state.bludger2Prev;
     const other = idx === 1 ? state.bludger2Pos : state.bludger1Pos;
-    const options = neighbors(pos).filter((n) => n !== other && n !== state.quafflePos && n !== ownPrev && n !== extraBan);
-    if (!options.length) return pos;
-    return options[Math.floor(rng() * options.length)] ?? pos;
+    const banned = new Set<string>();
+    if (prev) banned.add(prev);
+    if (extraBan) banned.add(extraBan);
+    const next = stepTo(pos, other, banned, onStunned(pos));
+    if (next === pos) return;
+    if (idx === 1) {
+      state.bludger1Prev = pos;
+      state.bludger1Pos = next;
+    } else {
+      state.bludger2Prev = pos;
+      state.bludger2Pos = next;
+    }
+    const who = occupant(state, next);
+    if (who) stunByBludger(state, who.id, next, idx, null);
   };
   const prev1 = state.bludger1Pos;
-  const next1 = stepOne(1, state.bludger1Prev, null);
-  if (next1 !== state.bludger1Pos) {
-    state.bludger1Prev = state.bludger1Pos;
-    state.bludger1Pos = next1;
-    const who = occupant(state, next1);
-    if (who) stunByBludger(state, who.id, next1, 1, null);
-  }
-  const next2 = stepOne(2, state.bludger2Prev, prev1);
-  if (next2 !== state.bludger1Pos && next2 !== state.bludger2Pos) {
-    state.bludger2Prev = state.bludger2Pos;
-    state.bludger2Pos = next2;
-    const who = occupant(state, next2);
-    if (who) stunByBludger(state, who.id, next2, 2, null);
-  }
+  shift(1, null);
+  shift(2, prev1);
   for (const which of [1, 2] as const) {
     const pos = which === 1 ? state.bludger1Pos : state.bludger2Pos;
     const who = occupant(state, pos);
-    if (!who || state.stunnedNow.includes(who.id) || state.stunnedForNext.includes(who.id)) continue;
+    if (!who || state.stunnedNow.includes(who.id) || state.stunnedForNext.includes(who.id) || ghosting(state, who.id)) continue;
     stunByBludger(state, who.id, pos, which, null);
+  }
+}
+
+function syncBludgerGhost(state: GameState, nextStun: Set<string>) {
+  if (!state.bludgerStreak) state.bludgerStreak = {};
+  if (!state.bludgerGhost) state.bludgerGhost = {};
+  for (const player of activePlayers(state)) {
+    const id = player.id;
+    if (nextStun.has(id)) {
+      state.bludgerStreak[id] = (state.bludgerStreak[id] ?? 0) + 1;
+      continue;
+    }
+    const streak = state.bludgerStreak[id] ?? 0;
+    if (streak >= 2) {
+      state.bludgerGhost[id] = 2;
+      event(state, "bludger_ghost", id, player.pos, { turns: 2 });
+    } else if ((state.bludgerGhost[id] ?? 0) > 0) {
+      state.bludgerGhost[id] -= 1;
+    }
+    state.bludgerStreak[id] = 0;
   }
 }
 
@@ -952,6 +1089,7 @@ function finalize(state: GameState) {
   state.stepPrepared = false;
   state.pendingGoal = null;
   const nextStun = new Set(state.stunnedForNext);
+  syncBludgerGhost(state, nextStun);
   state.stunnedNow = [];
   state.stunnedForNext = [];
   state.bludgerHit = [false, false];
@@ -980,7 +1118,7 @@ function runPhase(state: GameState, rng: Rng, phase: Phase): boolean {
   }
   if (phase === "snitch") {
     processSnitch(state, rng);
-    return Boolean(state.duel && !state.duel.resolvedAt);
+    return unresolvedDuels(state).some((duel) => duel.kind === "snitch");
   }
   if (phase === "auto_keeper") {
     autoKeeper(state);
@@ -993,31 +1131,27 @@ function runPhase(state: GameState, rng: Rng, phase: Phase): boolean {
   return false;
 }
 
-function maybeAdvance(state: GameState, rng: Rng, depth = 0) {
-  if (depth > 6 || state.finished || !state.started || state.paused) return;
+function maybeAdvance(state: GameState, rng: Rng) {
+  if (state.finished || !state.started || state.paused) return;
   if (!everyoneEnded(state)) return;
-  if (state.duel && !state.duel.resolvedAt) return;
+  if (unresolvedDuels(state).length) return;
   beginStep(state);
   while (state.phase !== "finalize") {
     const opened = runPhase(state, rng, state.phase);
-    if (opened || (state.duel && !state.duel.resolvedAt)) return;
+    if (opened || unresolvedDuels(state).length) return;
     const idx = PHASES.indexOf(state.phase);
     state.phase = PHASES[idx + 1] ?? "finalize";
   }
   finalize(state);
   if (state.finished) return;
-  if (activePlayers(state).length && activePlayers(state).every((p) => state.turns[p.id]?.stunned)) {
-    maybeAdvance(state, rng, depth + 1);
-  }
 }
 
 function duelComplete(duel: DuelState): boolean {
   return duel.participantIds.every((id) => duel.scores[id] != null);
 }
 
-function fillDuelGaps(state: GameState, rng: Rng, timedOut: boolean) {
-  const duel = state.duel;
-  if (!duel || duel.resolvedAt) return;
+function fillDuelGaps(state: GameState, duel: DuelState, rng: Rng, timedOut: boolean) {
+  if (duel.resolvedAt) return;
   for (const id of duel.participantIds) {
     if (duel.scores[id] != null) continue;
     const p = playerById(state, id);
@@ -1039,6 +1173,14 @@ function fillDuelGaps(state: GameState, rng: Rng, timedOut: boolean) {
   for (const id of missing) duel.scores[id] = 0;
 }
 
+function holdStunTurn(state: GameState): boolean {
+  const players = activePlayers(state);
+  if (!players.some((p) => state.turns[p.id]?.stunned)) return false;
+  if (Date.now() - state.stepStartedAt >= TURN_TIMEOUT_MS) return false;
+  const humanFree = players.some((p) => !p.isBot && !state.turns[p.id]?.stunned);
+  return !humanFree;
+}
+
 export function botDuelScore(level: BotLevel, rng: Rng): number {
   const table = { 1: [45, 22], 2: [62, 16], 3: [78, 12] } as const;
   const [mean, spread] = table[level];
@@ -1050,16 +1192,26 @@ export function pump(state: GameState, rng: Rng = Math.random): void {
   if (state.paused && state.pausedAt == null) state.pausedAt = Date.now();
   for (let i = 0; i < 10; i++) {
     if (state.finished || !state.started || state.paused) return;
-    if (state.duel && !state.duel.resolvedAt) {
-      const timedOut = Date.now() - state.duel.startedAt >= TURN_TIMEOUT_MS;
-      fillDuelGaps(state, rng, timedOut);
-      if (duelComplete(state.duel)) resolveDuel(state, rng);
-      else return;
+    const open = unresolvedDuels(state);
+    if (open.length) {
+      const timedOut = Date.now() - Math.min(...open.map((duel) => duel.startedAt)) >= TURN_TIMEOUT_MS;
+      for (const duel of open) fillDuelGaps(state, duel, rng, timedOut);
+      const order = ["pickup", "steal", "throw_steal", "hit_bludger", "snitch"];
+      const ready = unresolvedDuels(state)
+        .filter((duel) => duelComplete(duel))
+        .sort((a, b) => order.indexOf(a.kind) - order.indexOf(b.kind));
+      for (const duel of ready) resolveDuel(state, duel, rng);
+      const still = unresolvedDuels(state);
+      if (still.length) {
+        state.duel = still[0];
+        return;
+      }
+      const last = ensureDuels(state).filter((duel) => duel.resolvedAt).at(-1);
+      if (last) state.duel = last;
     }
-    const blocking =
-      state.duel &&
-      !state.duel.resolvedAt &&
-      (state.duel.kind === "steal" || state.duel.kind === "pickup" || state.duel.kind === "throw_steal" || state.duel.kind === "snitch");
+    const blocking = unresolvedDuels(state).some(
+      (duel) => duel.kind === "steal" || duel.kind === "pickup" || duel.kind === "throw_steal" || duel.kind === "snitch",
+    );
     if (!blocking && state.started && Date.now() - state.stepStartedAt >= TURN_TIMEOUT_MS) {
       for (const p of activePlayers(state)) {
         const turn = ensureTurn(state, p.id);
@@ -1075,10 +1227,11 @@ export function pump(state: GameState, rng: Rng = Math.random): void {
     }
     planBots(state, rng);
     if (!everyoneEnded(state)) return;
+    if (holdStunTurn(state)) return;
     const step = state.stepNo;
     const phase = state.phase;
     maybeAdvance(state, rng);
-    if (state.duel && !state.duel.resolvedAt) continue;
+    if (unresolvedDuels(state).length) continue;
     if (state.stepNo === step && state.phase === phase && !state.finished) return;
   }
 }
@@ -1086,11 +1239,12 @@ export function pump(state: GameState, rng: Rng = Math.random): void {
 export function submitScore(state: GameState, participantId: string, duelId: string, score: number): string | null {
   if (!state.started) return "game_not_started";
   if (state.finished) return "game_finished";
-  if (!state.duel || state.duel.id !== duelId || state.duel.resolvedAt) return "invalid_duel";
-  if (!state.duel.participantIds.includes(participantId)) return "not_participant";
+  const duel = unresolvedDuels(state).find((item) => item.id === duelId);
+  if (!duel) return "invalid_duel";
+  if (!duel.participantIds.includes(participantId)) return "not_participant";
   if (!Number.isInteger(score) || score < 0 || score > 100) return "invalid_score";
-  if (state.duel.scores[participantId] != null) return "alreadySubmitted";
-  state.duel.scores[participantId] = score;
+  if (duel.scores[participantId] != null) return "alreadySubmitted";
+  duel.scores[participantId] = score;
   return null;
 }
 
@@ -1175,7 +1329,7 @@ export function togglePause(state: GameState, playerId: string): string | null {
   const pausedAt = state.pausedAt ?? Date.now();
   const held = Math.max(0, Date.now() - pausedAt);
   state.stepStartedAt += held;
-  if (state.duel && !state.duel.resolvedAt) state.duel.startedAt += held;
+  for (const duel of unresolvedDuels(state)) duel.startedAt += held;
   state.paused = false;
   state.pausedAt = null;
   return null;
@@ -1263,7 +1417,7 @@ export function buildResults(state: GameState) {
 
 function planBots(state: GameState, rng: Rng) {
   if (!state.started || state.paused || state.finished) return;
-  if (state.duel && !state.duel.resolvedAt) return;
+  if (unresolvedDuels(state).length) return;
   for (const bot of activePlayers(state)) {
     if (!bot.isBot) continue;
     const turn = ensureTurn(state, bot.id);
@@ -1512,25 +1666,30 @@ export function publicState(state: GameState, viewerId: string | null) {
   for (const p of activePlayers(state)) {
     if (p.role) takenRoles[`${p.team}:${p.role}`] = { participantId: p.id, nickname: p.nickname, isBot: p.isBot, botDifficulty: p.botDifficulty };
   }
-  const reservedMoves = Object.values(state.turns)
-    .map((t) => t.plannedTo)
-    .filter((x): x is string => Boolean(x));
-  const duel =
-    state.duel && (!state.duel.resolvedAt || Date.now() - state.duel.resolvedAt < 10000)
-      ? {
-          id: state.duel.id,
-          attackerId: state.duel.attackerId,
-          defenderId: state.duel.defenderId,
-          participantIds: state.duel.participantIds,
-          kind: state.duel.kind,
-          targetPos: state.duel.targetPos,
-          createdStepNo: state.duel.createdStepNo,
-          startedAt: state.duel.startedAt,
-          resolvedAt: state.duel.resolvedAt,
-          winnerId: state.duel.winnerId,
-          scores: state.duel.scores,
-        }
-      : null;
+  const reservedMoves: string[] = [];
+  const shownReserved: string[] = [];
+  for (const p of activePlayers(state)) {
+    const to = state.turns[p.id]?.plannedTo;
+    if (!to) continue;
+    reservedMoves.push(to);
+    if (p.id !== viewer?.id && !isKeeper(p.role)) shownReserved.push(to);
+  }
+  const duels = ensureDuels(state)
+    .filter((duel) => !duel.resolvedAt || Date.now() - (duel.resolvedAt ?? 0) < 10000)
+    .map((duel) => ({
+      id: duel.id,
+      attackerId: duel.attackerId,
+      defenderId: duel.defenderId,
+      participantIds: duel.participantIds,
+      kind: duel.kind,
+      targetPos: duel.targetPos,
+      createdStepNo: duel.createdStepNo,
+      startedAt: duel.startedAt,
+      resolvedAt: duel.resolvedAt,
+      winnerId: duel.winnerId,
+      scores: duel.scores,
+    }));
+  const duel = duels.find((item) => !item.resolvedAt) ?? duels[0] ?? null;
   const chat = state.chat
     .filter((m) => {
       if (m.scope === "all") return true;
@@ -1588,6 +1747,7 @@ export function publicState(state: GameState, viewerId: string | null) {
           {
             ended: Boolean(t?.ended),
             stunned: Boolean(t?.stunned),
+            bludgerGhost: (state.bludgerGhost?.[p.id] ?? 0) > 0,
             plannedTo: own ? (t?.plannedTo ?? null) : null,
             plannedActionType: own ? (t?.plannedActionType ?? null) : null,
             plannedActionTo: own ? (t?.plannedActionTo ?? null) : null,
@@ -1598,6 +1758,7 @@ export function publicState(state: GameState, viewerId: string | null) {
       }),
     ),
     reservedMoves,
+    shownReserved,
     bludgers: [state.bludger1Pos, state.bludger2Pos] as [string, string],
     snitch: {
       pos: state.snitchRevealed ? state.snitchPos : null,
@@ -1617,6 +1778,7 @@ export function publicState(state: GameState, viewerId: string | null) {
     })),
     chat: { messages: chat },
     duel,
+    duels,
     seekerProgress: activePlayers(state)
       .filter((p) => isSeeker(p.role))
       .map((p) => ({ id: p.id, team: p.team, nickname: p.nickname, progress: p.snitchProgress })),

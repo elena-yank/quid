@@ -1,5 +1,5 @@
-import { teamLabel, type Counters, type RoleKey, type TeamKey } from "@/lib/quidditch/types";
-import { MESSAGES, type MessageKey } from "@/lib/quidditch/messages";
+import { teamLabel, type Counters, type RoleKey, type TeamKey } from "./types.ts";
+import { MESSAGES, type MessageKey } from "./messages.ts";
 
 const FALLBACK: Record<MessageKey, string> = {
   free_quaffle_pickup: "[Имя игрока] подбирает квоффл!",
@@ -35,7 +35,7 @@ export type FeedSnap = {
   holderId: string | null;
   snitchRevealed: boolean;
   snitchCaughtById: string | null;
-  events: { id: string; kind: string; actorId: string | null }[];
+  events: { id: string; kind: string; actorId: string | null; meta?: Record<string, unknown> }[];
   duel: { kind: string; attackerId: string | null; defenderId: string | null; winnerId: string | null } | null;
 };
 
@@ -141,7 +141,11 @@ export function captureFeed(prev: FeedSnap | null, next: FeedSnap, seen: Set<str
     goal: "goal_scored",
   };
   for (const [kind, key] of Object.entries(batches)) {
-    const fresh = next.events.filter((event) => event.kind === kind && !seen.has(event.id));
+    const fresh = next.events.filter((event) => {
+      if (event.kind !== kind || seen.has(event.id)) return false;
+      if (kind === "goal" && event.meta?.outcome === "saved_by_keeper") return false;
+      return true;
+    });
     const counter =
       key === "bludger_hit" ? next.counters.bludgerHit : key === "bludger_stun" ? next.counters.bludgerStun : next.counters.goalScored;
     const total = Math.max(fresh.length, counter ?? 0);
@@ -153,6 +157,12 @@ export function captureFeed(prev: FeedSnap | null, next: FeedSnap, seen: Set<str
       const person = event.actorId ? people.get(event.actorId) : undefined;
       push(key, startNo + index, { actor, team: person ? teamLabel(person.team) : "" });
     });
+  }
+  for (const event of next.events) {
+    if (event.kind !== "bludger_ghost" || seen.has(event.id)) continue;
+    seen.add(event.id);
+    const actor = named(event.actorId, true);
+    if (actor) lines.push(`${actor} на два хода невидим для бладжеров`);
   }
   for (const event of next.events) seen.add(event.id);
   if (!prev.snitchRevealed && next.snitchRevealed) push("snitch_reveal", next.counters.snitchReveal ?? 0, {});
@@ -176,7 +186,10 @@ export function captureFeed(prev: FeedSnap | null, next: FeedSnap, seen: Set<str
         next.duel.attackerId === nextHolder.id &&
         next.duel.defenderId === prevHolder.id;
       const cross = prevHolder.team !== nextHolder.team && (isChaser(nextHolder.role) || nextHolder.role === "keeper");
-      if (duelSteal || cross) {
+      const keeperSaved = next.events.some(
+        (event) => event.kind === "goal" && event.meta?.outcome === "saved_by_keeper" && event.actorId === nextHolder.id,
+      );
+      if ((duelSteal || cross) && !keeperSaved) {
         push("quaffle_steal", next.counters.quaffleSteal ?? 0, { actor: personHtml(nextHolder), team: teamLabel(nextHolder.team) });
       }
     }
@@ -201,6 +214,8 @@ export function plainEventLine(
   if (kind === "quaffle_duel_result") return `Борьба за квоффл завершена${meta.winnerId ? `, победитель ${other(meta.winnerId)}` : ""}`;
   if (kind === "hit_bludger") return `${who} ударил бладжер ${String(meta.bludgerIdx ?? "")} в ${targetPos ?? ""}`.trim();
   if (kind === "stun_bludger") return `${who} оглушился бладжером в ${targetPos ?? ""}`.trim();
+  if (kind === "bludger_ghost") return `${who} на два хода невидим для бладжеров`;
+  if (kind === "goal" && meta.outcome === "saved_by_keeper") return `${who} поймал квоффл и спас ворота`;
   if (kind === "goal") return `Гол! ${who} пропустил гол`;
   if (kind === "snitch_catch") return `${who} поймал снитч`;
   if (kind === "snitch_reveal") return "Снитч обнаружен";

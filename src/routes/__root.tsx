@@ -22,6 +22,7 @@ export const Route = createRootRoute({
   component: () => (
     <html lang="ru" suppressHydrationWarning>
       <head>
+        <link rel="preload" as="image" href="/assets/board.webp" fetchPriority="high" />
         <HeadContent />
       </head>
       <body>

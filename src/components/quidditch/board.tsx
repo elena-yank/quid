@@ -4,12 +4,14 @@ import { GOALS_LEFT, GOALS_RIGHT } from "@/lib/quidditch/rules";
 import { roleLetter, teamRgb } from "@/lib/quidditch/types";
 import { Ball } from "./balls";
 
-const GOALS = new Set([...GOALS_LEFT, ...GOALS_RIGHT]);
+const GOALS_A = new Set(GOALS_LEFT);
+const GOALS_B = new Set(GOALS_RIGHT);
 
 export function Board({
   view,
   meId,
   moves,
+  taken,
   targets,
   planned,
   actionTo,
@@ -18,31 +20,41 @@ export function Board({
   view: ClientState;
   meId: string | null;
   moves: string[];
+  taken: string[];
   targets: string[];
   planned: string | null;
   actionTo: string | null;
   onCell: (coord: string) => void;
 }) {
   const moveSet = new Set(moves);
+  const takenSet = new Set(taken);
   const targetSet = new Set(targets);
   const byPos = new Map(view.participants.filter((p) => p.pos).map((p) => [p.pos as string, p]));
   return (
     <div className="pitch-wrap">
-      <img className="pitch" src="/assets/board.svg" alt="Поле квиддича" />
+      <img className="pitch" src="/assets/board.webp" alt="Поле квиддича" width={1876} height={1166} fetchPriority="high" decoding="sync" />
       <div className="grid">
         {BOARD_CELLS.map((cell) => {
             const coord = cell.coord;
+            const gateTeam = GOALS_A.has(coord) ? view.game.teamA : GOALS_B.has(coord) ? view.game.teamB : null;
             const cls = [
               "cell",
-              GOALS.has(coord) ? "gate" : "",
+              gateTeam ? "gate" : "",
               moveSet.has(coord) ? "target" : "",
+              !moveSet.has(coord) && takenSet.has(coord) && !targetSet.has(coord) ? "taken" : "",
               targetSet.has(coord) ? "shot" : "",
               actionTo === coord ? "chosen" : "",
               planned === coord ? "planned" : "",
             ]
               .filter(Boolean)
               .join(" ");
-            const box = { left: `${cell.left}%`, top: `${cell.top}%`, width: `${cell.width}%`, height: `${cell.height}%` };
+            const box: Record<string, string> = {
+              left: `${cell.left}%`,
+              top: `${cell.top}%`,
+              width: `${cell.width}%`,
+              height: `${cell.height}%`,
+            };
+            if (gateTeam) box["--gate"] = teamRgb(gateTeam);
             return (
               <button key={coord} type="button" className={cls} title={coord} style={box} onClick={() => onCell(coord)} />
             );
@@ -63,7 +75,7 @@ export function Board({
                 {snitch ? <Ball kind="snitch" /> : null}
                 {person ? (
                   <span
-                    className={`piece${person.id === meId ? " me" : ""}${view.turnStates[person.id]?.stunned ? " stunned" : ""}`}
+                    className={`piece${person.id === meId ? " me" : ""}${view.turnStates[person.id]?.stunned ? " stunned" : ""}${view.turnStates[person.id]?.bludgerGhost ? " immune" : ""}`}
                     style={{ background: `rgb(${teamRgb(person.team)})` }}
                   >
                     {roleLetter(person.role)}

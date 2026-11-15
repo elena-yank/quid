@@ -13,7 +13,7 @@ import {
   sendTurn,
   syncRoom,
 } from "@/lib/quidditch/api";
-import { actionOk, legalMoves, quaffleLocked } from "@/lib/quidditch/assist";
+import { actionOk, legalMoves, quaffleLocked, takenCells } from "@/lib/quidditch/assist";
 import { errorText } from "@/lib/quidditch/errors";
 import { attackGoals, chebyshev, isBeater, isChaser, isKeeper, isSeeker, lineCells } from "@/lib/quidditch/rules";
 import { roleLabel, teamLabel, type ActionType, type PlanInput } from "@/lib/quidditch/types";
@@ -69,6 +69,54 @@ function playTurnTick(second: number) {
   }
 }
 
+function remainSeconds(deadline: number, paused: boolean, pausedAt: number | null, offset: number) {
+  const clock = paused && pausedAt != null ? pausedAt : Date.now() + offset;
+  return Math.max(0, Math.ceil((deadline - clock) / 1000));
+}
+
+function TurnClock({
+  deadline,
+  paused,
+  pausedAt,
+  stepNo,
+  offset,
+}: {
+  deadline: number;
+  paused: boolean;
+  pausedAt: number | null;
+  stepNo: number;
+  offset: { current: number };
+}) {
+  const [remain, setRemain] = useState(() => remainSeconds(deadline, paused, pausedAt, offset.current));
+  useEffect(() => {
+    let timer = 0;
+    let stop = false;
+    const last = { mark: "" };
+    const tick = () => {
+      if (stop) return;
+      const next = remainSeconds(deadline, paused, pausedAt, offset.current);
+      setRemain(next);
+      if (!paused && next <= 5) {
+        const mark = `${stepNo}:${next}`;
+        if (last.mark !== mark) {
+          last.mark = mark;
+          playTurnTick(next);
+        }
+      }
+      if (paused || next <= 0) return;
+      const clock = Date.now() + offset.current;
+      const leftMs = Math.max(0, deadline - clock);
+      timer = window.setTimeout(tick, leftMs % 1000 || 1000);
+    };
+    tick();
+    return () => {
+      stop = true;
+      window.clearTimeout(timer);
+    };
+  }, [deadline, paused, pausedAt, stepNo, offset]);
+  return <span className={remain <= 3 ? "timer warn" : "timer"}> · {remain}с</span>;
+}
+
 function readSeat(code: string): Seat | null {
   const raw = sessionStorage.getItem("quidditch.seat") || localStorage.getItem(`quidditch.seat.${code}`);
   if (!raw) return null;
@@ -91,7 +139,6 @@ export function Room({ code }: { code: string }) {
   const [scope, setScope] = useState<"all" | "team">("all");
   const [chatOn, setChatOn] = useState(true);
   const [feed, setFeed] = useState<string[]>([]);
-  const [now, setNow] = useState(Date.now());
   const [light, setLight] = useState(false);
   const [showResults, setShowResults] = useState(false);
   const [roster, setRoster] = useState<null | "players" | "watchers">(null);
@@ -99,7 +146,7 @@ export function Room({ code }: { code: string }) {
   const seenEvents = useRef(new Set<string>());
   const auto = useRef("");
   const offset = useRef(0);
-  const lastTick = useRef("");
+  const resultsShown = useRef(false);
 
   useEffect(() => {
     setSeat(readSeat(code));
@@ -110,8 +157,16 @@ export function Room({ code }: { code: string }) {
   }, [code]);
 
   useEffect(() => {
-    const id = window.setInterval(() => setNow(Date.now()), 250);
-    return () => window.clearInterval(id);
+    const unlock = () => {
+      const ctx = countdownAudio();
+      if (ctx?.state === "suspended") void ctx.resume();
+    };
+    window.addEventListener("pointerdown", unlock);
+    window.addEventListener("keydown", unlock);
+    return () => {
+      window.removeEventListener("pointerdown", unlock);
+      window.removeEventListener("keydown", unlock);
+    };
   }, []);
 
   useEffect(() => {
@@ -120,6 +175,7 @@ export function Room({ code }: { code: string }) {
     let stop = false;
     async function pull() {
       if (stop) return;
+      const sent = Date.now();
       const res = await syncRoom({ data: { code, participantId: current.participantId, sessionToken: current.token } });
       if (stop) return;
       if (!res.ok) {
@@ -130,9 +186,13 @@ export function Room({ code }: { code: string }) {
         }
         return;
       }
-      offset.current = res.state.serverNow - Date.now();
+      const rtt = Date.now() - sent;
+      offset.current = res.state.serverNow - (sent + rtt / 2);
       setView(res.state);
-      if (res.state.game.finished) setShowResults(true);
+      if (res.state.game.finished && !resultsShown.current) {
+        resultsShown.current = true;
+        setShowResults(true);
+      }
     }
     void pull();
     const id = window.setInterval(() => void pull(), 2000);
@@ -173,14 +233,19 @@ export function Room({ code }: { code: string }) {
   }, [view]);
 
   const me = view?.participants.find((p) => p.id === seat?.participantId) ?? null;
+  const pendingDuels =
+    view && me
+      ? liveDuels(view).filter((duel) => duel.participantIds.includes(me.id) && duel.scores[me.id] == null)
+      : [];
   const turn = me && view ? view.turnStates[me.id] : null;
   const locked = view ? quaffleLocked(view) : false;
   const moves = useMemo(() => (view && me && !turn?.ended && !turn?.stunned ? legalMoves(view, me.id) : []), [view, me, turn?.ended, turn?.stunned]);
+  const taken = useMemo(() => (view && me && !turn?.ended && !turn?.stunned ? takenCells(view, me.id) : []), [view, me, turn?.ended, turn?.stunned]);
   const targets = useMemo(() => (view && me && draft.type ? targetCells(view, me.id, draft, turn?.plannedTo ?? null) : []), [view, me, draft, turn?.plannedTo]);
 
   useEffect(() => {
     if (!view || !me || !seat) return;
-    if (!view.game.started || view.game.paused || view.game.finished || view.duel && !view.duel.resolvedAt) return;
+    if (!view.game.started || view.game.paused || view.game.finished || liveDuels(view).length) return;
     const mine = view.turnStates[me.id];
     if (!mine || mine.ended || mine.stunned || me.isObserver) return;
     if (moves.length > 0 || hasAction(view, me.id)) return;
@@ -228,7 +293,8 @@ export function Room({ code }: { code: string }) {
       return;
     }
     if (!moves.includes(coord)) {
-      if (draft.type && needsTarget(draft.type)) note(draft.type === "throw" && isChaser(me.role) ? "not_opponent_goal" : "invalid_target");
+      if (taken.includes(coord)) note("cell_reserved");
+      else if (draft.type && needsTarget(draft.type)) note(draft.type === "throw" && isChaser(me.role) ? "not_opponent_goal" : "invalid_target");
       return;
     }
     const res = await sendPlan({ data: { code, participantId: seat.participantId, sessionToken: seat.token, to: coord } });
@@ -274,38 +340,15 @@ export function Room({ code }: { code: string }) {
     }
   }
 
-  async function clickScore(score: number) {
-    if (!view?.duel || !seat) return;
+  async function clickScore(duelId: string, score: number) {
+    if (!seat) return;
     const res = await sendDuel({
-      data: { code, participantId: seat.participantId, sessionToken: seat.token, duelId: view.duel.id, score },
+      data: { code, participantId: seat.participantId, sessionToken: seat.token, duelId, score },
     });
     if (!res.ok && res.error !== "alreadySubmitted") note(res.error);
     if (res.ok) setView(res.state);
   }
 
-  const clock = view?.game.paused && view.game.pausedAt != null ? view.game.pausedAt : now + offset.current;
-  const remain = view ? Math.max(0, Math.ceil((view.game.stepStartedAt + view.turnMs - clock) / 1000)) : 0;
-
-  useEffect(() => {
-    const unlock = () => {
-      const ctx = countdownAudio();
-      if (ctx?.state === "suspended") void ctx.resume();
-    };
-    window.addEventListener("pointerdown", unlock);
-    window.addEventListener("keydown", unlock);
-    return () => {
-      window.removeEventListener("pointerdown", unlock);
-      window.removeEventListener("keydown", unlock);
-    };
-  }, []);
-
-  useEffect(() => {
-    if (!view?.game.started || view.game.finished || view.game.paused || remain > 5) return;
-    const mark = `${view.game.stepNo}:${remain}`;
-    if (lastTick.current === mark) return;
-    lastTick.current = mark;
-    playTurnTick(remain);
-  }, [remain, view?.game.finished, view?.game.paused, view?.game.started, view?.game.stepNo]);
   const judgeInRoom = view?.participants.some((p) => p.isJudge);
   const waiting = view ? view.participants.filter((p) => p.role && !p.isObserver && !view.turnStates[p.id]?.ended).length : 0;
 
@@ -325,7 +368,9 @@ export function Room({ code }: { code: string }) {
   if (!view || !me) {
     return (
       <main className="shell">
-        <p className="tagline">Собираем поле…</p>
+        <div className="pitch-wrap">
+          <img className="pitch" src="/assets/board.webp" alt="Поле квиддича" width={1876} height={1166} fetchPriority="high" decoding="sync" />
+        </div>
       </main>
     );
   }
@@ -426,7 +471,15 @@ export function Room({ code }: { code: string }) {
             <div className="grow" />
             <p className="pitch-status">
               Ход {view.game.stepNo}
-              {view.game.started && !view.game.finished ? <span className={remain <= 3 ? "timer warn" : "timer"}> · {remain}с</span> : null}
+              {view.game.started && !view.game.finished ? (
+                <TurnClock
+                  deadline={view.game.stepStartedAt + view.turnMs}
+                  paused={view.game.paused}
+                  pausedAt={view.game.pausedAt}
+                  stepNo={view.game.stepNo}
+                  offset={offset}
+                />
+              ) : null}
               {" · "}
               <b className={`team-${view.game.teamA}`}>{view.game.scoreA}</b>
               {" : "}
@@ -438,6 +491,7 @@ export function Room({ code }: { code: string }) {
             view={view}
             meId={me.id}
             moves={canPlay ? moves : []}
+            taken={canPlay ? taken : []}
             targets={canPlay ? targets : []}
             planned={turn?.plannedTo ?? null}
             actionTo={draft.to}
@@ -613,8 +667,18 @@ export function Room({ code }: { code: string }) {
           </>
         ) : null}
       </section>
-      {view.duel && !view.duel.resolvedAt && view.duel.participantIds.includes(me.id) && view.duel.scores[me.id] == null ? (
-        <DuelBox duel={view.duel} names={view.participants} onScore={(n) => void clickScore(n)} />
+      {pendingDuels.length ? (
+        <div className="overlay duel-stack">
+          {pendingDuels.map((duel, index) => (
+            <DuelBox
+              key={duel.id}
+              duel={duel}
+              names={view.participants}
+              listenKeys={index === 0}
+              onScore={(n) => void clickScore(duel.id, n)}
+            />
+          ))}
+        </div>
       ) : null}
       {roster ? (
         <div className="overlay" onClick={() => setRoster(null)}>
@@ -848,6 +912,11 @@ function chooseFirst(view: ClientState, id: string, draft: Draft, plannedTo: str
   return true;
 }
 
+function liveDuels(view: ClientState) {
+  const list = view.duels?.length ? view.duels : view.duel ? [view.duel] : [];
+  return list.filter((duel) => !duel.resolvedAt);
+}
+
 const DUEL_LABEL: Record<string, string> = {
   pickup: "Кто подберёт квоффл",
   steal: "Выхват квоффла",
@@ -859,10 +928,12 @@ const DUEL_LABEL: Record<string, string> = {
 function DuelBox({
   duel,
   names,
+  listenKeys,
   onScore,
 }: {
   duel: NonNullable<ClientState["duel"]>;
   names: ClientState["participants"];
+  listenKeys: boolean;
   onScore: (n: number) => void;
 }) {
   const sent = useRef(false);
@@ -877,7 +948,7 @@ function DuelBox({
     if (sent.current) return;
     sent.current = true;
     const score = Math.max(0, Math.min(100, Math.round(pctRef.current)));
-    if (marker.current) marker.current.style.left = `${score}%`;
+    if (marker.current) marker.current.style.width = `${score}%`;
     if (readout.current) readout.current.textContent = String(score);
     setLockedScore(score);
     onScoreRef.current(score);
@@ -890,11 +961,14 @@ function DuelBox({
       if (sent.current) return;
       const next = (((now - start) % 2200) / 2200) * 100;
       pctRef.current = next;
-      if (marker.current) marker.current.style.left = `${next}%`;
+      if (marker.current) marker.current.style.width = `${next}%`;
       if (readout.current) readout.current.textContent = String(Math.round(next));
       raf = requestAnimationFrame(loop);
     };
     raf = requestAnimationFrame(loop);
+    if (!listenKeys) {
+      return () => cancelAnimationFrame(raf);
+    }
     const onKey = (event: KeyboardEvent) => {
       if (event.code !== "Space" && event.key !== " ") return;
       event.preventDefault();
@@ -906,13 +980,12 @@ function DuelBox({
       cancelAnimationFrame(raf);
       window.removeEventListener("keydown", onKey, true);
     };
-  }, [duel.id]);
+  }, [duel.id, listenKeys]);
 
   const label = DUEL_LABEL[duel.kind] ?? "Дуэль";
   const who = duel.participantIds.map((id) => names.find((p) => p.id === id)?.nickname ?? "игрок").join(" · ");
   return (
-    <div className="overlay">
-      <div className="card modal form">
+    <div className="card modal form">
         <h2>{label}</h2>
         <p>{who}. Кликните по полосе или нажмите пробел ближе к правому краю.</p>
         <button
@@ -927,7 +1000,6 @@ function DuelBox({
           <i ref={marker} />
         </button>
         <p ref={readout}>{lockedScore ?? 0}</p>
-      </div>
     </div>
   );
 }
