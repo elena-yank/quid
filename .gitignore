@@ -1,0 +1,36 @@
+# dependencies
+node_modules/
+.node_modules.lock
+
+# build output
+.output/
+.tanstack/
+.vercel/
+dist/
+build/
+*.tsbuildinfo
+
+# env & secrets
+.env
+.env.*
+!.env.example
+
+# logs
+*.log
+logs/
+
+# sandbox / agent tooling state
+.grok/
+
+# QA & design artifacts (not part of the app)
+screenshots/
+artifacts/
+attachments/
+
+# editors / OS
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
