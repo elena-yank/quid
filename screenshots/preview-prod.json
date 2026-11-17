@@ -1,0 +1,38 @@
+{
+  "url": "http://127.0.0.1:8081/",
+  "viewports": {
+    "desktop": {
+      "width": 1280,
+      "height": 800,
+      "status": 200,
+      "title": "Квиддич",
+      "hasCanvas": false,
+      "bodyTextLen": 359,
+      "bodyTextHash": "359465b21b34c892b5adfb17ee555f073d584217539ded0446d8806a6412e60b",
+      "bodyTextPrefix": "МИР ГАРРИ ПОТТЕРА Квиддич HTTPS://VK.RU/MAGICHGWARTS_SCHOOL Созд",
+      "horizontalOverflow": false,
+      "consoleErrors": [],
+      "pageErrors": [],
+      "screenshot": "/workspace/screenshots/preview-prod.png"
+    },
+    "mobile": {
+      "width": 390,
+      "height": 844,
+      "status": 200,
+      "title": "Квиддич",
+      "hasCanvas": false,
+      "bodyTextLen": 359,
+      "bodyTextHash": "359465b21b34c892b5adfb17ee555f073d584217539ded0446d8806a6412e60b",
+      "bodyTextPrefix": "МИР ГАРРИ ПОТТЕРА Квиддич HTTPS://VK.RU/MAGICHGWARTS_SCHOOL Созд",
+      "horizontalOverflow": false,
+      "consoleErrors": [],
+      "pageErrors": [],
+      "screenshot": "/workspace/screenshots/preview-prod-mobile.png"
+    }
+  },
+  "brandWarnings": [],
+  "authWarnings": [],
+  "verdictFile": "/workspace/screenshots/preview-prod.json",
+  "divergesFromBaseline": false,
+  "baselineReasons": []
+}

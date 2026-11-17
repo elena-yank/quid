@@ -11,7 +11,7 @@ const TEXT: Record<string, string> = {
   game_not_started: "Сначала начните игру",
   role_taken: "Роль уже занята",
   cell_taken: "Клетка занята игроком",
-  cell_reserved: "Клетку уже заявка другого игрока",
+  cell_reserved: "Клетка уже выбрана другим игроком",
   cell_occupied_by_ball: "На клетке мяч",
   observer_cannot_plan: "Наблюдатель не ходит",
   observer_cannot_end: "Наблюдатель не завершает ход",

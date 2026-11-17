@@ -189,12 +189,15 @@ export function activePlayers(state: GameState): Participant[] {
   return state.participants.filter((p) => !p.isObserver && isActiveRole(p.role));
 }
 
-export function ballCells(state: Pick<GameState, "quafflePos" | "bludger1Pos" | "bludger2Pos" | "snitchPos">): Set<string> {
+export function ballCells(
+  state: Pick<GameState, "quafflePos" | "bludger1Pos" | "bludger2Pos" | "snitchPos" | "snitchRevealed">,
+): Set<string> {
   const set = new Set<string>();
   if (state.quafflePos) set.add(state.quafflePos);
   if (state.bludger1Pos) set.add(state.bludger1Pos);
   if (state.bludger2Pos) set.add(state.bludger2Pos);
-  if (state.snitchPos) set.add(state.snitchPos);
+  // A hidden snitch is invisible. Blocking the square makes an empty cell look occupied.
+  if (state.snitchPos && state.snitchRevealed) set.add(state.snitchPos);
   return set;
 }
 
@@ -388,5 +391,6 @@ export function freshTurn(stepNo: number, stunned = false): TurnState {
     plannedActionBludger: null,
     actionSpent: false,
     originPos: null,
+    declaredAt: null,
   };
 }

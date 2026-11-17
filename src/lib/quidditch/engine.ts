@@ -277,10 +277,33 @@ function stepBeyond(from: string, cell: string): string | null {
   return rcToCoord(b.r + dr, b.c + dc);
 }
 
+function nextDeclaredAt(state: GameState): number {
+  let max = 0;
+  for (const turn of Object.values(state.turns)) {
+    if (typeof turn.declaredAt === "number" && turn.declaredAt > max) max = turn.declaredAt;
+  }
+  return max + 1;
+}
+
+function dropHeldQuaffle(state: GameState, id: string) {
+  if (state.quaffleHolderId !== id) return;
+  const pos = playerById(state, id)?.pos ?? "D7";
+  const blocked = new Set<string>();
+  for (const p of state.participants) if (!p.isObserver && p.pos) blocked.add(p.pos);
+  if (state.bludger1Pos) blocked.add(state.bludger1Pos);
+  if (state.bludger2Pos) blocked.add(state.bludger2Pos);
+  if (state.snitchPos) blocked.add(state.snitchPos);
+  const adjacent = neighbors(pos).filter((cell) => !blocked.has(cell));
+  const spot = adjacent[0] ?? nearestFree(state, pos);
+  releaseQuaffle(state, spot === pos ? nearestFree(state, pos) : spot, true);
+}
+
 function stunByBludger(state: GameState, id: string, pos: string, which: 1 | 2, actorId: string | null) {
   if (ghosting(state, id)) return;
-  if (state.stunnedForNext.includes(id)) return;
-  stunPlayer(state, id);
+  const already = state.stunnedForNext.includes(id);
+  if (!already) stunPlayer(state, id);
+  dropHeldQuaffle(state, id);
+  if (already) return;
   if (actorId) {
     const actor = playerById(state, actorId);
     if (actor) actor.stats.bludgerHitsToPlayers += 1;
@@ -297,10 +320,7 @@ function stunPlayer(state: GameState, id: string) {
     turn.actionSpent = true;
     turn.plannedTo = null;
   }
-  if (state.quaffleHolderId === id) {
-    const pos = playerById(state, id)?.pos ?? "D7";
-    releaseQuaffle(state, nearestFree(state, pos), true);
-  }
+  if (state.quaffleHolderId === id) dropHeldQuaffle(state, id);
 }
 
 function addScore(state: GameState, side: Side, points: number) {
@@ -585,7 +605,7 @@ function openDuel(
   if (!state.duel || state.duel.resolvedAt) state.duel = duel;
 }
 
-function pickWinner(duel: DuelState, holderId: string | null) {
+function pickWinner(state: GameState, duel: DuelState, holderId: string | null) {
   let best = -1;
   const bestIds: string[] = [];
   for (const id of duel.participantIds) {
@@ -604,7 +624,13 @@ function pickWinner(duel: DuelState, holderId: string | null) {
   if (duel.kind === "pickup" || duel.kind === "snitch") {
     return { winnerId: null, topTie, bestScore: best, bestIds, tiePolicy: "free" };
   }
-  return { winnerId: [...bestIds].sort()[0] ?? null, topTie, bestScore: best, bestIds, tiePolicy: "lex" };
+  const winnerId =
+    [...bestIds].sort((a, b) => {
+      const ta = state.turns[a]?.declaredAt ?? Number.MAX_SAFE_INTEGER;
+      const tb = state.turns[b]?.declaredAt ?? Number.MAX_SAFE_INTEGER;
+      return ta - tb || a.localeCompare(b);
+    })[0] ?? null;
+  return { winnerId, topTie, bestScore: best, bestIds, tiePolicy: "first" };
 }
 
 function movedAlready(state: GameState): boolean {
@@ -640,7 +666,7 @@ function applyDeferredContestWins(state: GameState) {
 
 function resolveDuel(state: GameState, duel: DuelState, _rng: Rng) {
   if (duel.resolvedAt) return;
-  const picked = pickWinner(duel, duel.holderId);
+  const picked = pickWinner(state, duel, duel.holderId);
   duel.resolvedAt = Date.now();
   duel.winnerId = picked.winnerId;
   if (duel.kind === "pickup" || duel.kind === "steal" || duel.kind === "throw_steal") {
@@ -767,12 +793,16 @@ function applyMovement(state: GameState) {
       return turn?.plannedTo && !state.stunnedNow.includes(p.id) && !turn.stunned;
     })
     .sort((a, b) => a.createdAt - b.createdAt);
-  const cancelled = new Set<string>();
-  const claimed = new Set<string>();
+  const claim = new Map<string, string>();
   for (const p of movers) {
     const to = state.turns[p.id].plannedTo;
-    if (!to || claimed.has(to)) cancelled.add(p.id);
-    else claimed.add(to);
+    if (!to || claim.has(to)) continue;
+    claim.set(to, p.id);
+  }
+  const cancelled = new Set<string>();
+  for (const p of movers) {
+    const to = state.turns[p.id].plannedTo;
+    if (!to || claim.get(to) !== p.id) cancelled.add(p.id);
   }
   let guard = 0;
   let changed = true;
@@ -783,11 +813,6 @@ function applyMovement(state: GameState) {
       if (cancelled.has(p.id)) continue;
       const to = state.turns[p.id].plannedTo;
       if (!to) continue;
-      if (ballCells(state).has(to)) {
-        cancelled.add(p.id);
-        changed = true;
-        continue;
-      }
       const blockedByStill = activePlayers(state).some((q) => {
         if (q.pos !== to) return false;
         if (q.id === p.id) return false;
@@ -1039,22 +1064,28 @@ function syncBludgerGhost(state: GameState, nextStun: Set<string>) {
   if (!state.bludgerGhost) state.bludgerGhost = {};
   for (const player of activePlayers(state)) {
     const id = player.id;
-    if (nextStun.has(id)) {
-      state.bludgerStreak[id] = (state.bludgerStreak[id] ?? 0) + 1;
+    const ghost = state.bludgerGhost[id] ?? 0;
+    if (ghost > 0) {
+      state.bludgerGhost[id] = ghost - 1;
+      state.bludgerStreak[id] = 0;
       continue;
     }
-    const streak = state.bludgerStreak[id] ?? 0;
-    if (streak >= 2) {
-      state.bludgerGhost[id] = 2;
-      event(state, "bludger_ghost", id, player.pos, { turns: 2 });
-    } else if ((state.bludgerGhost[id] ?? 0) > 0) {
-      state.bludgerGhost[id] -= 1;
+    if (nextStun.has(id)) {
+      const streak = (state.bludgerStreak[id] ?? 0) + 1;
+      state.bludgerStreak[id] = streak;
+      if (streak >= 2) {
+        state.bludgerGhost[id] = 2;
+        state.bludgerStreak[id] = 0;
+        event(state, "bludger_ghost", id, player.pos, { turns: 2 });
+      }
+      continue;
     }
     state.bludgerStreak[id] = 0;
   }
 }
 
 function finalize(state: GameState) {
+  for (const id of state.stunnedForNext) dropHeldQuaffle(state, id);
   const players = activePlayers(state).map((p) => ({
     id: p.id,
     nickname: p.nickname,
@@ -1215,14 +1246,7 @@ export function pump(state: GameState, rng: Rng = Math.random): void {
     if (!blocking && state.started && Date.now() - state.stepStartedAt >= TURN_TIMEOUT_MS) {
       for (const p of activePlayers(state)) {
         const turn = ensureTurn(state, p.id);
-        if (!turn.ended) {
-          turn.ended = true;
-          turn.plannedTo = null;
-          turn.plannedActionType = null;
-          turn.plannedActionTo = null;
-          turn.plannedActionBludger = null;
-          turn.plannedActionFirst = null;
-        }
+        if (!turn.ended) turn.ended = true;
       }
     }
     planBots(state, rng);
@@ -1299,6 +1323,7 @@ export function endTurn(state: GameState, playerId: string, plan: PlanInput): st
   turn.plannedActionFirst = actionType ? first : null;
   turn.ended = true;
   turn.actionSpent = false;
+  if (turn.declaredAt == null) turn.declaredAt = nextDeclaredAt(state);
   return null;
 }
 
@@ -1458,6 +1483,7 @@ function planBots(state: GameState, rng: Rng) {
       }
     }
     turn.ended = true;
+    if (turn.declaredAt == null) turn.declaredAt = nextDeclaredAt(state);
   }
 }
 
@@ -1642,22 +1668,19 @@ function chaserOk(from: string, to: string): boolean {
 }
 
 function pickMove(from: string, moves: string[], target: string | null, rng: Rng, mistake: number, _allowStay: boolean): string | null {
-  if (rng() < mistake) {
-    if (rng() < 0.35) return null;
-    if (!moves.length) return null;
-    return moves[Math.floor(rng() * moves.length)] ?? null;
-  }
-  if (!target) return moves[0] ?? null;
-  let best: string | null = null;
-  let bestD = chebyshev(from, target) - 0.2;
-  for (const m of moves) {
-    const d = chebyshev(m, target);
-    if (d < bestD) {
-      bestD = d;
-      best = m;
-    }
-  }
-  return best;
+  if (!moves.length) return null;
+  if (rng() < mistake) return moves[Math.floor(rng() * moves.length)] ?? null;
+  if (!target) return moves[Math.floor(rng() * moves.length)] ?? null;
+  const here = chebyshev(from, target);
+  const ranked = moves
+    .map((m) => ({ m, d: chebyshev(m, target) }))
+    .sort((a, b) => a.d - b.d || a.m.localeCompare(b.m));
+  const closer = ranked.find((step) => step.d < here);
+  if (closer) return closer.m;
+  if (here === 0) return null;
+  const aside = ranked.find((step) => step.d <= here);
+  if (aside) return aside.m;
+  return ranked[0]?.m ?? null;
 }
 
 export function publicState(state: GameState, viewerId: string | null) {
@@ -1698,6 +1721,7 @@ export function publicState(state: GameState, viewerId: string | null) {
     })
     .slice(-80);
   return {
+    revision: state.version,
     serverNow: Date.now(),
     turnMs: TURN_TIMEOUT_MS,
     messageCounters: state.counters,

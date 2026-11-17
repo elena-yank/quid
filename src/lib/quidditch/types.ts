@@ -80,6 +80,7 @@ export interface TurnState {
   plannedActionBludger: 1 | 2 | null;
   actionSpent: boolean;
   originPos: string | null;
+  declaredAt: number | null;
 }
 
 export interface DuelState {

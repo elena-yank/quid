@@ -47,11 +47,16 @@ async function load(sql: Sql, code: string): Promise<Row | null> {
 }
 
 async function save(sql: Sql, row: Row, state: GameState): Promise<boolean> {
+  const previous = state.version;
+  state.version = (typeof previous === "number" ? previous : 0) + 1;
   const rows = await sql.query<{ version: number }>(
     "update kw_games set state = $1::jsonb, version = version + 1 where id = $2 and version = $3 returning version",
     [JSON.stringify(state), row.id, row.version],
   );
-  if (!rows[0]) return false;
+  if (!rows[0]) {
+    state.version = previous;
+    return false;
+  }
   row.version = rows[0].version;
   row.state = state;
   return true;
@@ -166,14 +171,18 @@ export async function syncRoom(data: { code?: string; participantId?: string; se
     if (!code) return { ok: false as const, error: "invalid_code" };
     return lock(code, async () => {
       const sql = await getSql();
-      const row = await load(sql, code);
-      if (!row) return { ok: false as const, error: "not_found" };
-      const state = row.state as GameState;
-      const viewer = authed(state, data.participantId, data.sessionToken);
-      if ((data.participantId || data.sessionToken) && !viewer) return { ok: false as const, error: "invalid_session" };
-      pump(state);
-      await save(sql, row, state);
-      return { ok: true as const, state: publicState(state, viewer?.id ?? null) };
+      for (let attempt = 0; attempt < 4; attempt++) {
+        const row = await load(sql, code);
+        if (!row) return { ok: false as const, error: "not_found" };
+        const state = row.state as GameState;
+        const viewer = authed(state, data.participantId, data.sessionToken);
+        if ((data.participantId || data.sessionToken) && !viewer) return { ok: false as const, error: "invalid_session" };
+        pump(state);
+        const wrote = await save(sql, row, state);
+        if (!wrote) continue;
+        return { ok: true as const, state: publicState(state, viewer?.id ?? null) };
+      }
+      return { ok: false as const, error: "conflict" };
     });
   }
 

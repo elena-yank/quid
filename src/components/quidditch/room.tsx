@@ -61,7 +61,11 @@ function playTurnTick(second: number) {
   const freq = 360 + tension * 980;
   const peak = 0.04 + tension * 0.14;
   const type: OscillatorType = tension > 0.8 ? "square" : tension > 0.4 ? "triangle" : "sine";
-  const pulses = second <= 0 ? 3 : second <= 1 ? 2 : 1;
+  if (second <= 0) {
+    tone(ctx, now, 150, 0.04, 0.1, "sine");
+    return;
+  }
+  const pulses = second <= 1 ? 2 : 1;
   for (let i = 0; i < pulses; i++) {
     const start = now + i * (0.09 - tension * 0.02);
     tone(ctx, start, freq * (1 + i * 0.04), peak, 0.07 + (1 - tension) * 0.05, type);
@@ -143,10 +147,15 @@ export function Room({ code }: { code: string }) {
   const [showResults, setShowResults] = useState(false);
   const [roster, setRoster] = useState<null | "players" | "watchers">(null);
   const prevFeed = useRef<FeedSnap | null>(null);
-  const seenEvents = useRef(new Set<string>());
+  const seen = useRef(new Set<string>());
+  const rev = useRef(0);
   const auto = useRef("");
   const offset = useRef(0);
   const resultsShown = useRef(false);
+  const duelSnaps = useRef(new Map<string, NonNullable<ClientState["duels"]>[number]>());
+  const duelPins = useRef<Record<string, number>>({});
+  const [duelPin, setDuelPin] = useState<Record<string, number>>({});
+  const [duelClosed, setDuelClosed] = useState<Set<string>>(() => new Set());
 
   useEffect(() => {
     setSeat(readSeat(code));
@@ -188,7 +197,7 @@ export function Room({ code }: { code: string }) {
       }
       const rtt = Date.now() - sent;
       offset.current = res.state.serverNow - (sent + rtt / 2);
-      setView(res.state);
+      adopt(res.state);
       if (res.state.game.finished && !resultsShown.current) {
         resultsShown.current = true;
         setShowResults(true);
@@ -227,15 +236,22 @@ export function Room({ code }: { code: string }) {
           }
         : null,
     };
-    const lines = captureFeed(prevFeed.current, snap, seenEvents.current);
+    const lines = captureFeed(prevFeed.current, snap, seen.current);
     prevFeed.current = snap;
     if (lines.length) setFeed((items) => [...items, ...lines].slice(-60));
   }, [view]);
 
   const me = view?.participants.find((p) => p.id === seat?.participantId) ?? null;
-  const pendingDuels =
+  if (view && me) {
+    for (const duel of view.duels ?? []) {
+      if (!duel.participantIds.includes(me.id)) continue;
+      if (!duelSnaps.current.has(duel.id) && duel.resolvedAt) continue;
+      duelSnaps.current.set(duel.id, duel);
+    }
+  }
+  const duelCards =
     view && me
-      ? liveDuels(view).filter((duel) => duel.participantIds.includes(me.id) && duel.scores[me.id] == null)
+      ? [...duelSnaps.current.values()].filter((duel) => duel.participantIds.includes(me.id) && !duelClosed.has(duel.id))
       : [];
   const turn = me && view ? view.turnStates[me.id] : null;
   const locked = view ? quaffleLocked(view) : false;
@@ -260,9 +276,16 @@ export function Room({ code }: { code: string }) {
         plan: { to: null, actionFirst: null, actionType: null, actionTo: null, actionBludger: null },
       },
     }).then((res) => {
-      if (res.ok) setView(res.state);
+      if (res.ok) adopt(res.state);
     });
   }, [view, me, seat, moves.length, code]);
+
+  function adopt(state: ClientState) {
+    const revision = state.revision ?? 0;
+    if (revision < rev.current) return;
+    rev.current = revision;
+    setView(state);
+  }
 
   function note(error?: string) {
     const beaterBall =
@@ -288,19 +311,25 @@ export function Room({ code }: { code: string }) {
     if (turn?.plannedTo === coord) {
       const res = await sendPlan({ data: { code, participantId: seat.participantId, sessionToken: seat.token, to: null } });
       if (!res.ok) note(res.error);
-      else setView(res.state);
+      else adopt(res.state);
       setMoveAt(null);
       return;
     }
     if (!moves.includes(coord)) {
+      const ball =
+        view.quaffle.pos === coord ||
+        view.bludgers.includes(coord) ||
+        (view.snitch.revealed && view.snitch.pos === coord);
       if (taken.includes(coord)) note("cell_reserved");
+      else if (view.participants.some((p) => !p.isObserver && p.pos === coord)) note("cell_taken");
+      else if (ball) note("cell_occupied_by_ball");
       else if (draft.type && needsTarget(draft.type)) note(draft.type === "throw" && isChaser(me.role) ? "not_opponent_goal" : "invalid_target");
       return;
     }
     const res = await sendPlan({ data: { code, participantId: seat.participantId, sessionToken: seat.token, to: coord } });
     if (!res.ok) note(res.error);
     else {
-      setView(res.state);
+      adopt(res.state);
       setMoveAt(Date.now());
     }
   }
@@ -320,7 +349,7 @@ export function Room({ code }: { code: string }) {
     }
     if (type && needsTarget(type) && !draft.to) type = null;
     const plannedTo = view.turnStates[me.id]?.plannedTo ?? null;
-    const to = plannedTo && moves.includes(plannedTo) ? plannedTo : null;
+    const to = plannedTo;
     let actionTo = type ? draft.to : null;
     let actionBludger = type === "hit_bludger" ? draft.bludger : null;
     let actionFirst = type ? chooseFirst(view, me.id, { ...draft, type }, to, moveAt) : null;
@@ -334,7 +363,7 @@ export function Room({ code }: { code: string }) {
     const res = await sendTurn({ data: { code, participantId: seat.participantId, sessionToken: seat.token, plan } });
     if (!res.ok) note(res.error);
     else {
-      setView(res.state);
+      adopt(res.state);
       setDraft(EMPTY);
       setMoveAt(null);
     }
@@ -346,7 +375,7 @@ export function Room({ code }: { code: string }) {
       data: { code, participantId: seat.participantId, sessionToken: seat.token, duelId, score },
     });
     if (!res.ok && res.error !== "alreadySubmitted") note(res.error);
-    if (res.ok) setView(res.state);
+    if (res.ok) adopt(res.state);
   }
 
   const judgeInRoom = view?.participants.some((p) => p.isJudge);
@@ -373,6 +402,21 @@ export function Room({ code }: { code: string }) {
         </div>
       </main>
     );
+  }
+
+  function closeDuelResults(onlyId?: string) {
+    if (!me) return;
+    setDuelClosed((prev) => {
+      const next = new Set(prev);
+      const ids = onlyId ? [onlyId] : [...duelSnaps.current.keys()];
+      for (const id of ids) {
+        const duel = duelSnaps.current.get(id);
+        if (!duel) continue;
+        const done = duelPins.current[id] != null || duel.scores[me.id] != null || duel.resolvedAt != null;
+        if (done) next.add(id);
+      }
+      return next;
+    });
   }
 
   const canPlay = !me.isObserver && view.game.started && !view.game.paused && !view.game.finished && !turn?.ended && !turn?.stunned;
@@ -513,13 +557,13 @@ export function Room({ code }: { code: string }) {
           {(!view.game.started && (me.isJudge || !me.isObserver || judgeInRoom)) || me.isJudge ? (
           <section className="panel">
             {!view.game.started && (me.isJudge || (!me.isObserver && !judgeInRoom)) ? (
-              <button className="primary" type="button" onClick={() => void sendStart({ data: creds(code, seat) }).then((r) => (r.ok ? setView(r.state) : note(r.error)))}>
+              <button className="primary" type="button" onClick={() => void sendStart({ data: creds(code, seat) }).then((r) => (r.ok ? adopt(r.state) : note(r.error)))}>
                 Начать игру
               </button>
             ) : null}
             {!view.game.started && judgeInRoom && !me.isJudge ? <p>Ждём, пока судья начнёт матч.</p> : null}
             {me.isJudge ? (
-              <button className="ghost" type="button" onClick={() => void sendPause({ data: creds(code, seat) }).then((r) => (r.ok ? setView(r.state) : note(r.error)))}>
+              <button className="ghost" type="button" onClick={() => void sendPause({ data: creds(code, seat) }).then((r) => (r.ok ? adopt(r.state) : note(r.error)))}>
                 {view.game.paused ? "Продолжить" : "Пауза"}
               </button>
             ) : null}
@@ -611,7 +655,7 @@ export function Room({ code }: { code: string }) {
           </section>
         </aside>
       </div>
-      {me.isJudge ? <JudgePanel view={view} code={code} seat={seat} onDone={setView} onError={note} /> : null}
+      {me.isJudge ? <JudgePanel view={view} code={code} seat={seat} onDone={adopt} onError={note} /> : null}
       <section className="panel chat">
         <div className="score">
           <strong>Чат</strong>
@@ -641,7 +685,7 @@ export function Room({ code }: { code: string }) {
                   if (!res.ok) note(res.error);
                   else {
                     setChatText("");
-                    setView(res.state);
+                    adopt(res.state);
                   }
                 });
               }}
@@ -667,17 +711,40 @@ export function Room({ code }: { code: string }) {
           </>
         ) : null}
       </section>
-      {pendingDuels.length ? (
-        <div className="overlay duel-stack">
-          {pendingDuels.map((duel, index) => (
-            <DuelBox
-              key={duel.id}
-              duel={duel}
-              names={view.participants}
-              listenKeys={index === 0}
-              onScore={(n) => void clickScore(duel.id, n)}
-            />
-          ))}
+      {duelCards.length ? (
+        <div className="overlay duel-stack" onClick={() => closeDuelResults()}>
+          {duelCards.map((duel, index) => {
+            const local = duelPin[duel.id];
+            const done = local != null || duel.scores[me.id] != null || duel.resolvedAt != null;
+            if (!done) {
+              const earlierOpen = duelCards.slice(0, index).some((item) => {
+                return duelPin[item.id] == null && item.scores[me.id] == null && item.resolvedAt == null;
+              });
+              return (
+                <DuelBox
+                  key={duel.id}
+                  duel={duel}
+                  names={view.participants}
+                  listenKeys={!earlierOpen}
+                  onScore={(n) => {
+                    duelPins.current = { ...duelPins.current, [duel.id]: n };
+                    setDuelPin(duelPins.current);
+                    void clickScore(duel.id, n);
+                  }}
+                />
+              );
+            }
+            return (
+              <DuelResult
+                key={duel.id}
+                duel={duel}
+                names={view.participants}
+                mineId={me.id}
+                localScore={local ?? null}
+                onClose={() => closeDuelResults(duel.id)}
+              />
+            );
+          })}
         </div>
       ) : null}
       {roster ? (
@@ -985,7 +1052,7 @@ function DuelBox({
   const label = DUEL_LABEL[duel.kind] ?? "Дуэль";
   const who = duel.participantIds.map((id) => names.find((p) => p.id === id)?.nickname ?? "игрок").join(" · ");
   return (
-    <div className="card modal form">
+    <div className="card modal form" onClick={(event) => event.stopPropagation()}>
         <h2>{label}</h2>
         <p>{who}. Кликните по полосе или нажмите пробел ближе к правому краю.</p>
         <button
@@ -1000,6 +1067,48 @@ function DuelBox({
           <i ref={marker} />
         </button>
         <p ref={readout}>{lockedScore ?? 0}</p>
+    </div>
+  );
+}
+
+function DuelResult({
+  duel,
+  names,
+  mineId,
+  localScore,
+  onClose,
+}: {
+  duel: NonNullable<ClientState["duels"]>[number];
+  names: ClientState["participants"];
+  mineId: string;
+  localScore: number | null;
+  onClose: () => void;
+}) {
+  const label = DUEL_LABEL[duel.kind] ?? "Дуэль";
+  const rows = duel.participantIds.map((id) => {
+    const person = names.find((p) => p.id === id);
+    const server = duel.scores[id];
+    const score = server != null ? server : id === mineId ? localScore : null;
+    return { id, name: person?.nickname ?? "игрок", team: person?.team ?? null, score };
+  });
+  const waiting = rows.some((row) => row.score == null);
+  return (
+    <div className="card modal form duel-result" onClick={(event) => event.stopPropagation()}>
+      <div className="duel-head">
+        <h2>{label}</h2>
+        <button className="ghost duel-x" type="button" aria-label="Закрыть" onClick={onClose}>
+          ×
+        </button>
+      </div>
+      <p>{waiting ? "Ждём остальных." : "Результаты"}</p>
+      <ul className="duel-scores">
+        {rows.map((row) => (
+          <li key={row.id} className={duel.resolvedAt && duel.winnerId === row.id ? "win" : ""}>
+            <b className={row.team ? `team-${row.team}` : ""}>{row.name}</b>
+            <span>{row.score == null ? "…" : `${row.score}%`}</span>
+          </li>
+        ))}
+      </ul>
     </div>
   );
 }
@@ -1109,6 +1218,7 @@ function ResultsTable({ view }: { view: ClientState }) {
                 <br />
                 голов
               </th>
+              <th>Сейвы</th>
               <th>
                 Поймано
                 <br />
@@ -1131,6 +1241,7 @@ function ResultsTable({ view }: { view: ClientState }) {
                   <td />
                   <td />
                   <td />
+                  <td />
                 </tr>
                 {team.players.map((p) => (
                   <tr key={p.id}>
@@ -1144,6 +1255,7 @@ function ResultsTable({ view }: { view: ClientState }) {
                     <td>{p.bludgerHits}</td>
                     <td>{p.bludgerHitsToPlayers}</td>
                     <td>{p.goals}</td>
+                    <td>{p.saves}</td>
                     <td>{p.snitches}</td>
                     <td>{p.points}</td>
                   </tr>
@@ -1184,11 +1296,25 @@ function renderResults(view: ClientState, logo: HTMLImageElement | null): Blob |
   if (!results) return null;
   const teams = [results.teamA, results.teamB];
   const bodyRows = teams.reduce((sum, team) => sum + 1 + team.players.length, 0);
-  const width = 1758;
   const marginX = 31;
   const tableTop = 144;
   const headerH = 84;
   const rowH = 56;
+  const cols: { w: number; head: string[]; pick: (p: ResultsPlayer) => string }[] = [
+    { w: 290, head: ["Имя"], pick: (p) => p.nickname },
+    { w: 154, head: ["Роль"], pick: (p) => roleLabel(p.role) },
+    { w: 154, head: ["Взято", "квоффлов"], pick: (p) => String(p.pickups) },
+    { w: 154, head: ["Украдено", "квоффлов"], pick: (p) => String(p.steals) },
+    { w: 154, head: ["Пасы"], pick: (p) => String(p.passes) },
+    { w: 154, head: ["Удары по", "бладжеру"], pick: (p) => String(p.bludgerHits) },
+    { w: 154, head: ["Попаданий", "бладжером"], pick: (p) => String(p.bludgerHitsToPlayers) },
+    { w: 154, head: ["Поймано", "голов"], pick: (p) => String(p.goals) },
+    { w: 154, head: ["Сейвы"], pick: (p) => String(p.saves) },
+    { w: 154, head: ["Поймано", "снитчей"], pick: (p) => String(p.snitches) },
+    { w: 154, head: ["Очки"], pick: (p) => String(p.points) },
+  ];
+  const tableW = cols.reduce((sum, col) => sum + col.w, 0);
+  const width = marginX + tableW + marginX;
   const tableH = headerH + bodyRows * rowH;
   const logoH = logo ? 130 : 0;
   const height = tableTop + tableH + (logo ? 78 + logoH + 52 : 64);
@@ -1213,19 +1339,6 @@ function renderResults(view: ClientState, logo: HTMLImageElement | null): Blob |
   ctx.fillStyle = sub;
   ctx.font = "400 22px Manrope, Segoe UI, sans-serif";
   ctx.fillText(`Счёт: ${results.scoreA} — ${results.scoreB} · Ход: ${view.game.stepNo}`, marginX, 104);
-
-  const cols: { w: number; head: string[]; pick: (p: ResultsPlayer) => string }[] = [
-    { w: 290, head: ["Имя"], pick: (p) => p.nickname },
-    { w: 154, head: ["Роль"], pick: (p) => roleLabel(p.role) },
-    { w: 154, head: ["Взято", "квоффлов"], pick: (p) => String(p.pickups) },
-    { w: 154, head: ["Украдено", "квоффлов"], pick: (p) => String(p.steals) },
-    { w: 154, head: ["Пасы"], pick: (p) => String(p.passes) },
-    { w: 154, head: ["Удары по", "бладжеру"], pick: (p) => String(p.bludgerHits) },
-    { w: 154, head: ["Попаданий", "бладжером"], pick: (p) => String(p.bludgerHitsToPlayers) },
-    { w: 154, head: ["Поймано", "голов"], pick: (p) => String(p.goals) },
-    { w: 154, head: ["Поймано", "снитчей"], pick: (p) => String(p.snitches) },
-    { w: 154, head: ["Очки"], pick: (p) => String(p.points) },
-  ];
   const xs: number[] = [];
   let x = marginX;
   for (const col of cols) {

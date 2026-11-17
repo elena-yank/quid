@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { addParticipant, createMatch, endTurn, publicState, pump, startGame, submitScore } from "./engine.ts";
+import { addParticipant, buildResults, createMatch, endTurn, planMove, publicState, pump, startGame, submitScore } from "./engine.ts";
 import { legalMoves, takenCells } from "./assist.ts";
 import { captureFeed, plainEventLine } from "./feed.ts";
 import { isAllowedChaserMove, isAllowedKeeperMove, neighbors, TURN_TIMEOUT_MS } from "./rules.ts";
@@ -123,6 +123,11 @@ test("keeper can step into the hoop and save a pre-move shot", () => {
   assert.equal(state.quaffleHolderId, keeper.id);
   assert.equal(keeper.stats.goalsSaved, 1);
   assert.equal(keeper.pos, "C13");
+  const results = buildResults(state);
+  const shown = [...results.teamA.players, ...results.teamB.players];
+  assert.equal(shown.find((p) => p.id === keeper.id)?.saves, 1);
+  assert.equal(shown.find((p) => p.id === chaser.id)?.saves, 0);
+  assert.equal(shown.every((p) => typeof p.saves === "number"), true);
 });
 
 test("chaser can steal on the turn they fly next to the holder", () => {
@@ -949,29 +954,27 @@ test("two bludger stuns in a row make the player invisible for the next two turn
   pump(state, () => 0);
   assert.equal(state.turns[player.id]?.stunned, true);
   assert.equal(state.bludger2Pos, player.pos);
-  assert.equal(state.bludgerGhost[player.id] ?? 0, 0);
+  assert.equal(state.bludgerGhost[player.id], 2);
 
   beater.pos = "A1";
   assert.equal(endTurn(state, beater.id, stay), null);
   pump(state, () => 0);
   assert.equal(state.turns[player.id]?.stunned, false);
-  assert.equal(state.bludgerGhost[player.id], 2);
+  assert.equal(state.bludgerGhost[player.id], 1);
   assert.notEqual(state.bludger1Pos, player.pos);
   assert.notEqual(state.bludger2Pos, player.pos);
 
   const where = player.pos as string;
-  for (const left of [1, 0]) {
-    state.bludger1Pos = "E7";
-    state.bludger1Prev = null;
-    state.bludger2Pos = "A13";
-    state.bludger2Prev = null;
-    assert.equal(endTurn(state, player.id, stay), null);
-    assert.equal(endTurn(state, beater.id, stay), null);
-    pump(state, () => 0);
-    assert.notEqual(state.bludger1Pos, where);
-    assert.equal(state.turns[player.id]?.stunned, false);
-    assert.equal(state.bludgerGhost[player.id] ?? 0, left);
-  }
+  state.bludger1Pos = "E7";
+  state.bludger1Prev = null;
+  state.bludger2Pos = "A13";
+  state.bludger2Prev = null;
+  assert.equal(endTurn(state, player.id, stay), null);
+  assert.equal(endTurn(state, beater.id, stay), null);
+  pump(state, () => 0);
+  assert.notEqual(state.bludger1Pos, where);
+  assert.equal(state.turns[player.id]?.stunned, false);
+  assert.equal(state.bludgerGhost[player.id] ?? 0, 0);
 
   state.bludger1Pos = "E7";
   state.bludger1Prev = null;
@@ -1146,6 +1149,164 @@ test("a keeper save is not announced as a goal", () => {
   assert.equal(goal.length, 1);
   assert.match(goal[0], /Вера/);
 });
+
+test("a hidden snitch does not block an empty crease cell", () => {
+  const state = match();
+  const keeper = seat(state, "Кира", "gryffindor", "keeper");
+  const other = seat(state, "Боря", "slytherin", "chaser1");
+  keeper.pos = "D1";
+  other.pos = "G7";
+  state.snitchPos = "D2";
+  state.snitchRevealed = false;
+  state.quafflePos = "G13";
+  state.bludger1Pos = "A13";
+  state.bludger2Pos = "B13";
+  assert.equal(startGame(state, keeper.id), null);
+  assert.equal(planMove(state, keeper.id, "D2"), null);
+  assert.equal(state.turns[keeper.id]?.plannedTo, "D2");
+});
+
+test("clock expiry keeps the declared step", () => {
+  const state = match();
+  const hunter = seat(state, "Аня", "gryffindor", "chaser1");
+  const other = seat(state, "Боря", "slytherin", "chaser1");
+  hunter.pos = "D5";
+  other.pos = "A1";
+  state.quafflePos = "G13";
+  state.bludger1Pos = "A2";
+  state.bludger2Pos = "A3";
+  state.snitchPos = "G1";
+  state.snitchRevealed = false;
+  assert.equal(startGame(state, hunter.id), null);
+  const stay = { to: null, actionFirst: null, actionType: null, actionTo: null, actionBludger: null };
+  assert.equal(planMove(state, hunter.id, "D6"), null);
+  assert.equal(endTurn(state, other.id, stay), null);
+  state.stepStartedAt = Date.now() - TURN_TIMEOUT_MS - 5;
+  pump(state, () => 0.9);
+  assert.equal(hunter.pos, "D6");
+});
+
+test("a called crease cell stays with the caller and only lights up for the keeper", () => {
+  const state = match();
+  const keeper = seat(state, "Кира", "gryffindor", "keeper");
+  const hunter = seat(state, "Боря", "slytherin", "chaser1");
+  keeper.pos = "D1";
+  hunter.pos = "D4";
+  state.quafflePos = "G13";
+  state.bludger1Pos = "A13";
+  state.bludger2Pos = "B13";
+  state.snitchPos = "G1";
+  assert.equal(startGame(state, keeper.id), null);
+  const stay = { to: null, actionFirst: null, actionType: null, actionTo: null, actionBludger: null };
+  assert.equal(endTurn(state, hunter.id, { ...stay, to: "D2" }), null);
+  const view = publicState(state, keeper.id);
+  assert.equal(legalMoves(view, keeper.id).includes("D2"), false);
+  assert.equal(takenCells(view, keeper.id).includes("D2"), true);
+  assert.equal(planMove(state, keeper.id, "D2"), "cell_reserved");
+  assert.equal(endTurn(state, keeper.id, stay), null);
+  pump(state, () => 0.9);
+  assert.equal(hunter.pos, "D2");
+  assert.equal(keeper.pos, "D1");
+});
+
+test("a blocked bot sidesteps instead of freezing", () => {
+  const state = match();
+  const human = seat(state, "Аня", "gryffindor", "chaser1");
+  human.pos = "A1";
+  const bot = addParticipant(state, {
+    nickname: "Бот",
+    team: "slytherin",
+    role: "chaser2",
+    observer: false,
+    judge: false,
+    bot: true,
+    difficulty: 3,
+  });
+  bot.pos = "D5";
+  state.quafflePos = "D8";
+  state.bludger1Pos = "B7";
+  state.bludger2Pos = "C6";
+  state.snitchPos = "A13";
+  for (const [coord, name] of [
+    ["D6", "Раз"],
+    ["D7", "Два"],
+    ["E6", "Три"],
+    ["F7", "Четыре"],
+  ] as const) {
+    const blocker = addParticipant(state, {
+      nickname: name,
+      team: "gryffindor",
+      role: "beater",
+      observer: false,
+      judge: false,
+      bot: false,
+      difficulty: null,
+    });
+    blocker.pos = coord;
+    blocker.role = name === "Раз" ? "beater" : name === "Два" ? "seeker" : name === "Три" ? "keeper" : "chaser2";
+  }
+  assert.equal(startGame(state, human.id), null);
+  assert.equal(endTurn(state, human.id, { to: null, actionFirst: null, actionType: null, actionTo: null, actionBludger: null }), null);
+  pump(state, () => 0.5);
+  const dest = state.turns[bot.id]?.plannedTo;
+  assert.ok(dest);
+  assert.notEqual(dest, "D5");
+});
+
+test("an equal bludger score goes to whoever called the hit first", () => {
+  const state = match();
+  const a = seat(state, "Аня", "gryffindor", "beater");
+  const b = seat(state, "Боря", "slytherin", "beater");
+  a.pos = "A6";
+  b.pos = "C8";
+  state.bludger1Pos = "B7";
+  state.bludger2Pos = "G1";
+  state.quafflePos = "G13";
+  state.snitchPos = "A1";
+  assert.equal(startGame(state, a.id), null);
+  assert.equal(endTurn(state, a.id, { to: null, actionFirst: true, actionType: "hit_bludger", actionTo: "B8", actionBludger: 1 }), null);
+  assert.equal(endTurn(state, b.id, { to: null, actionFirst: true, actionType: "hit_bludger", actionTo: "B6", actionBludger: 1 }), null);
+  const [earlier, later] = [a, b].sort((x, y) => x.id.localeCompare(y.id));
+  state.turns[earlier.id].declaredAt = 2;
+  state.turns[later.id].declaredAt = 1;
+  pump(state, () => 0.2);
+  const duel = state.duels.find((item) => item.kind === "hit_bludger");
+  assert.ok(duel);
+  assert.equal(submitScore(state, a.id, duel.id, 50), null);
+  assert.equal(submitScore(state, b.id, duel.id, 50), null);
+  pump(state, () => 0.2);
+  assert.equal(duel.winnerId, later.id);
+  assert.equal(state.bludger1Pos, later.id === a.id ? "B8" : "B6");
+});
+
+test("a bludger hit knocks the quaffle onto a free neighbouring cell", () => {
+  const state = match();
+  const holder = seat(state, "Аня", "gryffindor", "chaser1");
+  const beater = seat(state, "Боря", "slytherin", "beater");
+  holder.pos = "D4";
+  beater.pos = "C2";
+  state.quaffleHolderId = holder.id;
+  state.quafflePos = null;
+  state.bludger1Pos = "D2";
+  state.bludger2Pos = "G7";
+  state.snitchPos = "A1";
+  assert.equal(startGame(state, holder.id), null);
+  assert.equal(
+    endTurn(state, beater.id, { to: null, actionFirst: true, actionType: "hit_bludger", actionTo: "D4", actionBludger: 1 }),
+    null,
+  );
+  assert.equal(endTurn(state, holder.id, { to: null, actionFirst: null, actionType: null, actionTo: null, actionBludger: null }), null);
+  pump(state, () => 0.2);
+  assert.equal(state.turns[holder.id]?.stunned, true);
+  assert.equal(state.quaffleHolderId, null);
+  assert.ok(state.quafflePos);
+  assert.equal(neighbors(holder.pos as string).includes(state.quafflePos as string), true);
+  assert.equal(
+    state.participants.some((p) => !p.isObserver && p.pos === state.quafflePos),
+    false,
+  );
+});
+
 
 
 

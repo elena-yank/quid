@@ -29,7 +29,19 @@ export function Board({
   const moveSet = new Set(moves);
   const takenSet = new Set(taken);
   const targetSet = new Set(targets);
-  const byPos = new Map(view.participants.filter((p) => p.pos).map((p) => [p.pos as string, p]));
+  const people = view.participants.filter((p) => p.pos && !p.isObserver);
+  const byPos = new Map<string, (typeof people)[number]>();
+  for (const person of people) {
+    if (!person.pos || byPos.has(person.pos)) continue;
+    byPos.set(person.pos, person);
+  }
+  if (meId && planned) {
+    const me = people.find((p) => p.id === meId);
+    if (me?.pos && me.pos !== planned && !byPos.has(planned)) {
+      if (byPos.get(me.pos)?.id === me.id) byPos.delete(me.pos);
+      byPos.set(planned, me);
+    }
+  }
   return (
     <div className="pitch-wrap">
       <img className="pitch" src="/assets/board.webp" alt="Поле квиддича" width={1876} height={1166} fetchPriority="high" decoding="sync" />

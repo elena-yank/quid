@@ -1,0 +1,38 @@
+{
+  "url": "http://127.0.0.1:8081/",
+  "viewports": {
+    "desktop": {
+      "width": 1280,
+      "height": 800,
+      "status": 200,
+      "title": "Квиддич",
+      "hasCanvas": false,
+      "bodyTextLen": 299,
+      "bodyTextHash": "d2640b277485acaeac003b3e5304659a9f4a278db010c13fb45cec97223b83cb",
+      "bodyTextPrefix": "Создать Присоединиться Наблюдать Команда A Гриффиндор Пуффендуй ",
+      "horizontalOverflow": false,
+      "consoleErrors": [],
+      "pageErrors": [],
+      "screenshot": "/workspace/screenshots/app-builder-built.png"
+    },
+    "mobile": {
+      "width": 390,
+      "height": 844,
+      "status": 200,
+      "title": "Квиддич",
+      "hasCanvas": false,
+      "bodyTextLen": 299,
+      "bodyTextHash": "d2640b277485acaeac003b3e5304659a9f4a278db010c13fb45cec97223b83cb",
+      "bodyTextPrefix": "Создать Присоединиться Наблюдать Команда A Гриффиндор Пуффендуй ",
+      "horizontalOverflow": false,
+      "consoleErrors": [],
+      "pageErrors": [],
+      "screenshot": "/workspace/screenshots/app-builder-built-mobile.png"
+    }
+  },
+  "brandWarnings": [],
+  "authWarnings": [],
+  "verdictFile": "/workspace/screenshots/app-builder-built.json",
+  "divergesFromBaseline": false,
+  "baselineReasons": []
+}
